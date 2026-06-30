@@ -1,0 +1,10 @@
+fastapi>=0.115
+firebase-admin>=6.5
+google-genai>=1.30
+numpy>=2.1
+scipy>=1.14
+uvicorn>=0.30
+websockets>=14
+pytz>=2024.1
+
+# bridge.py additionally needs a Python-3.14-compatible pjsua2/PJSIP build.
