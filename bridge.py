@@ -60,7 +60,7 @@ if sys.platform.startswith('win'):
         winmm.timeBeginPeriod(1)
     except Exception:
         pass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -137,6 +137,18 @@ def setup_logging(name: str = 'SIPBridge', level: int = logging.INFO):
 
 
 logger = setup_logging()
+_pj_thread_state = threading.local()
+
+
+def ensure_pj_thread_registered(label: str = "bridge") -> None:
+    """Register this Python thread before it touches pjsua2/PJLIB."""
+    if getattr(_pj_thread_state, "registered", False):
+        return
+    try:
+        pj.Endpoint.instance().libRegisterThread(f"{label}_{threading.get_ident()}")
+        _pj_thread_state.registered = True
+    except Exception as e:
+        logger.warning(f"⚠️ Could not register PJSIP thread {label}: {e}")
 
 # ==========================================
 # 1.5 FIREBASE
@@ -188,18 +200,18 @@ class BridgeConfig:
     RECEIVE_QUEUE_MAX_PACKETS: int = int(os.getenv("RECEIVE_QUEUE_MAX_PACKETS", "80"))
     CAPTURE_BATCH_FRAMES: int = int(os.getenv("CAPTURE_BATCH_FRAMES", "2"))
     CAPTURE_BATCH_MAX_LATENCY_SEC: float = float(os.getenv("CAPTURE_BATCH_MAX_LATENCY_SEC", "0.045"))
-    # Retain 300 ms immediately before VAD opens. Without preroll, the first
+    # Retain 1 second immediately before VAD opens. Without preroll, the first
     # consonant of short replies such as "athe"/"yes" is clipped and Gemini
     # may complete an empty turn even though speech was detected.
-    CAPTURE_PREROLL_FRAMES: int = int(os.getenv("CAPTURE_PREROLL_FRAMES", "36"))
+    CAPTURE_PREROLL_FRAMES: int = int(os.getenv("CAPTURE_PREROLL_FRAMES", "50"))
     CAPTURE_SPEECH_START_RMS: float = float(os.getenv("CAPTURE_SPEECH_START_RMS", "105"))
-    CAPTURE_SPEECH_START_FRAMES: int = int(os.getenv("CAPTURE_SPEECH_START_FRAMES", "2"))
-    CAPTURE_SPEECH_CONTINUE_RMS: float = float(os.getenv("CAPTURE_SPEECH_CONTINUE_RMS", "75"))
-    CAPTURE_SPEECH_TAIL_SEC: float = float(os.getenv("CAPTURE_SPEECH_TAIL_SEC", "0.95"))
+    CAPTURE_SPEECH_START_FRAMES: int = int(os.getenv("CAPTURE_SPEECH_START_FRAMES", "1"))
+    CAPTURE_SPEECH_CONTINUE_RMS: float = float(os.getenv("CAPTURE_SPEECH_CONTINUE_RMS", "65"))
+    CAPTURE_SPEECH_TAIL_SEC: float = float(os.getenv("CAPTURE_SPEECH_TAIL_SEC", "0.65"))
     # A wake/check word such as "Maya" can be shorter than 300 ms on a phone
     # line. Keep rejecting clicks, but do not throw away valid short speech.
-    CAPTURE_MIN_TURN_SEC: float = float(os.getenv("CAPTURE_MIN_TURN_SEC", "0.22"))
-    CAPTURE_MIN_SPEECH_END_INTERVAL_SEC: float = float(os.getenv("CAPTURE_MIN_SPEECH_END_INTERVAL_SEC", "0.60"))
+    CAPTURE_MIN_TURN_SEC: float = float(os.getenv("CAPTURE_MIN_TURN_SEC", "0.12"))
+    CAPTURE_MIN_SPEECH_END_INTERVAL_SEC: float = float(os.getenv("CAPTURE_MIN_SPEECH_END_INTERVAL_SEC", "0.35"))
     ECHO_TAIL_GUARD_SEC: float = 0.10
     AI_PLAYBACK_EMPTY_GRACE_SEC: float = 0.15
     POST_INTERRUPT_DROP_SEC: float = float(os.getenv("POST_INTERRUPT_DROP_SEC", "0.80"))
@@ -216,13 +228,13 @@ class BridgeConfig:
     AI_PLAYBACK_GAIN: float = float(os.getenv("AI_PLAYBACK_GAIN", "0.64"))
     AI_PLAYBACK_SOFT_PEAK: int = int(os.getenv("AI_PLAYBACK_SOFT_PEAK", "11800"))
     AI_PLAYBACK_SMOOTHING: float = float(os.getenv("AI_PLAYBACK_SMOOTHING", "0.38"))
-    ASR_TARGET_RMS: float = float(os.getenv("ASR_TARGET_RMS", "2200"))
-    ASR_MAX_GAIN: float = float(os.getenv("ASR_MAX_GAIN", "2.8"))
-    ASR_PEAK_LIMIT: int = int(os.getenv("ASR_PEAK_LIMIT", "22000"))
+    ASR_TARGET_RMS: float = float(os.getenv("ASR_TARGET_RMS", "1800"))
+    ASR_MAX_GAIN: float = float(os.getenv("ASR_MAX_GAIN", "2.2"))
+    ASR_PEAK_LIMIT: int = int(os.getenv("ASR_PEAK_LIMIT", "26000"))
     # Hold a steady cushion before starting/restarting playback. This jitter buffer
     # prevents momentary WebSocket/resampling delays from breaking Maya's voice.
-    PLAYBACK_PREROLL_FRAMES: int = int(os.getenv("PLAYBACK_PREROLL_FRAMES", "14"))
-    PLAYBACK_CONCEAL_FRAMES: int = int(os.getenv("PLAYBACK_CONCEAL_FRAMES", "40"))
+    PLAYBACK_PREROLL_FRAMES: int = int(os.getenv("PLAYBACK_PREROLL_FRAMES", "22"))
+    PLAYBACK_CONCEAL_FRAMES: int = int(os.getenv("PLAYBACK_CONCEAL_FRAMES", "70"))
 
     # Call Configuration
     AUTO_ANSWER: bool = True
@@ -329,9 +341,12 @@ def normalize_caller_pcm16(
         rms = float(np.sqrt(np.mean(np.square(audio))))
         if rms < 120.0:
             return audio_data
-        gain = min(max_gain, max(1.0, target_rms / rms))
         peak_limit = max(12000, min(30000, int(peak_limit)))
-        return np.clip(audio * gain, -peak_limit, peak_limit).astype(np.int16).tobytes()
+        peak = float(np.max(np.abs(audio)))
+        gain = min(max_gain, max(1.0, target_rms / rms))
+        if peak > 0:
+            gain = min(gain, float(peak_limit) / peak)
+        return np.clip(audio * gain, -32768, 32767).astype(np.int16).tobytes()
     except Exception:
         return audio_data
 
@@ -1014,6 +1029,7 @@ class AIWebSocketClient:
                 logger.info(f"   Call ID: {data.get('call_id')}")
                 # Hang up the SIP call
                 if self.call_object:
+                    ensure_pj_thread_registered("ai_hangup")
                     call_prm = pj.CallOpParam()
                     call_prm.statusCode = 200  # Normal call clearing
                     self.call_object.hangup(call_prm)
@@ -1526,20 +1542,20 @@ class AICall(pj.Call):
 
     def _speech_start_rms(self) -> float:
         noise_floor = getattr(self, "_caller_voice_noise_rms", 35.0)
-        return max(130.0, self.config.CAPTURE_SPEECH_START_RMS, noise_floor * 3.0)
+        return max(110.0, self.config.CAPTURE_SPEECH_START_RMS, noise_floor * 2.7)
 
     def _speech_start_frames(self) -> int:
-        return max(2, self.config.CAPTURE_SPEECH_START_FRAMES)
+        return max(1, self.config.CAPTURE_SPEECH_START_FRAMES)
 
     def _speech_continue_rms(self) -> float:
         noise_floor = getattr(self, "_caller_voice_noise_rms", 35.0)
         return max(70.0, self.config.CAPTURE_SPEECH_CONTINUE_RMS, noise_floor * 1.8)
 
     def _speech_tail_sec(self) -> float:
-        return max(0.80, self.config.CAPTURE_SPEECH_TAIL_SEC)
+        return max(0.55, self.config.CAPTURE_SPEECH_TAIL_SEC)
 
     def _min_turn_sec(self) -> float:
-        return max(0.18, self.config.CAPTURE_MIN_TURN_SEC)
+        return max(0.10, self.config.CAPTURE_MIN_TURN_SEC)
 
     async def _mark_caller_speech_start(self):
         if self._caller_speech_active:
@@ -1581,6 +1597,7 @@ class AICall(pj.Call):
         await self.ai_client.send_audio(batch)
 
     def transfer_to_extension(self, extension: str):
+        ensure_pj_thread_registered("ai_transfer")
         logger.info(f"🔄 INITIATING TRANSFER to {extension}")
         self.is_transferring = True
         self.extension_transferred_to = extension
@@ -1698,7 +1715,7 @@ class AICall(pj.Call):
             try:
                 call_id = str(call_info.id) if call_info else "unknown"
                 caller_id = "unknown"
-                pj.Endpoint.instance().libRegisterThread(f"aicall_{call_id}")
+                ensure_pj_thread_registered(f"aicall_{call_id}")
                 if call_info:
                     remote_uri = call_info.remoteUri
                     if "@" in remote_uri and ":" in remote_uri:
@@ -1715,6 +1732,13 @@ class AICall(pj.Call):
                     self.async_loop.run_until_complete(self._run_ai_client(ai_call_id, caller_id))
                 except asyncio.CancelledError:
                     logger.info("✅ AI Task Cancelled")
+                finally:
+                    pending = [t for t in asyncio.all_tasks(self.async_loop) if not t.done()]
+                    if pending:
+                        for task in pending:
+                            task.cancel()
+                        self.async_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    self.async_loop.close()
 
             except Exception as e:
                 logger.error(f"❌ AI integration error: {e}")
@@ -1723,10 +1747,11 @@ class AICall(pj.Call):
         self.async_thread.start()
 
     async def _shutdown_tasks(self):
-        tasks = [t for t in asyncio.all_tasks(self.async_loop) if t is not asyncio.current_task()]
-        for task in tasks: task.cancel()
+        loop = asyncio.get_running_loop()
+        tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task(loop)]
+        for task in tasks:
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        self.async_loop.stop()
 
     def _stop_ai_integration(self):
         logger.info("🛑 Stopping AI integration")
@@ -1749,8 +1774,13 @@ class AICall(pj.Call):
         def cleanup_async_loop():
             if self.async_loop and self.async_loop.is_running():
                 try:
-                    # Fire and forget the shutdown tasks
-                    asyncio.run_coroutine_threadsafe(self._shutdown_tasks(), self.async_loop)
+                    future = asyncio.run_coroutine_threadsafe(self._shutdown_tasks(), self.async_loop)
+                    try:
+                        future.result(timeout=3.0)
+                    except FutureTimeoutError:
+                        logger.warning("Timed out waiting for AI shutdown tasks")
+                    finally:
+                        self.async_loop.call_soon_threadsafe(self.async_loop.stop)
                 except Exception as e:
                     logger.warning(f"⚠️ Shutdown cleanup warning: {e}")
 
