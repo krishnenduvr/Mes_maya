@@ -90,7 +90,7 @@ class Settings:
     health_port: int = int(os.getenv("HEALTH_PORT", "9000"))
     input_silence_fallback_sec: float = float(os.getenv("MAYA_INPUT_SILENCE_FALLBACK_SEC", "0.75"))
     caller_audio_queue_packets: int = int(os.getenv("MAYA_CALLER_AUDIO_QUEUE_PACKETS", "400"))
-    caller_audio_flush_timeout_sec: float = float(os.getenv("MAYA_CALLER_AUDIO_FLUSH_TIMEOUT_SEC", "1.20"))
+    caller_audio_flush_timeout_sec: float = float(os.getenv("MAYA_CALLER_AUDIO_FLUSH_TIMEOUT_SEC", "0.50"))
     gemini_audio_send_timeout_sec: float = float(os.getenv("MAYA_GEMINI_AUDIO_SEND_TIMEOUT_SEC", "1.5"))
     use_firestore_prompt: bool = os.getenv("USE_FIRESTORE_PROMPT", "false").casefold() == "true"
 
@@ -998,7 +998,7 @@ def gemini_client_and_model():
 class MayaCall:
     # Send 50 ms blocks so the bridge receives steady speech without tiny
     # packets that add scheduler/network jitter.
-    OUTPUT_PACKET_BYTES = int(os.getenv("MAYA_OUTPUT_PACKET_BYTES", "2400"))
+    OUTPUT_PACKET_BYTES = int(os.getenv("MAYA_OUTPUT_PACKET_BYTES", "3600"))
 
     def __init__(self, websocket):
         self.ws = websocket
@@ -1230,21 +1230,20 @@ class MayaCall:
             self.turn_watchdog_task.cancel()
         self.turn_watchdog_task = asyncio.create_task(self.turn_watchdog())
 
+    def is_still_waiting_for_turn(self, speech_end_marker: float) -> bool:
+        return (
+            self.awaiting_response
+            and self.last_speech_end_at == speech_end_marker
+            and self.last_model_audio_at < speech_end_marker
+        )
+
     async def turn_watchdog(self):
         speech_end_marker = self.last_speech_end_at
         await asyncio.sleep(1.8)
-        if (
-            self.awaiting_response
-            and self.last_speech_end_at == speech_end_marker
-            and self.last_model_audio_at < speech_end_marker
-        ):
+        if self.is_still_waiting_for_turn(speech_end_marker):
             log.warning("[%s] No Gemini audio yet after caller activity ended", self.call_id)
         await asyncio.sleep(2.2)
-        if (
-            self.awaiting_response
-            and self.last_speech_end_at == speech_end_marker
-            and self.last_model_audio_at < speech_end_marker
-        ):
+        if self.is_still_waiting_for_turn(speech_end_marker):
             log.warning("[%s] Gemini still silent; asking caller to repeat", self.call_id)
             try:
                 await self.send_client_content(
@@ -1263,6 +1262,28 @@ class MayaCall:
                 self.receive_turn_ready.set()
             except Exception:
                 log.exception("[%s] Failed to request repeat prompt", self.call_id)
+                self.receive_turn_ready.set()
+        await asyncio.sleep(1.2)
+        if self.is_still_waiting_for_turn(speech_end_marker):
+            log.warning("[%s] Gemini remained silent after repeat prompt; forcing another turn flush", self.call_id)
+            try:
+                await self.send_realtime_input(audio_stream_end=True)
+            except Exception:
+                log.exception("[%s] Failed to force Gemini turn flush after silence", self.call_id)
+            self.receive_turn_ready.set()
+        await asyncio.sleep(1.5)
+        if self.is_still_waiting_for_turn(speech_end_marker):
+            log.error("[%s] Gemini silent recovery exhausted; reopening caller listening", self.call_id)
+            self.awaiting_response = False
+            self.empty_turn_retries = 0
+            self.response_audio_bytes = 0
+            self.output_audio.clear()
+            self.ai_speaking = False
+            try:
+                await self.send_json("ai_speaking", speaking=False)
+                await self.send_json("clear", reason="gemini_silent_recovery")
+            except Exception:
+                log.exception("[%s] Failed to notify bridge after Gemini silent recovery", self.call_id)
 
     async def enable_listening_fallback(self):
         """Never leave a call muted forever if the bridge loses welcome_completed."""
